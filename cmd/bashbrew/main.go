@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 
 	"github.com/sirupsen/logrus" // this is used by containerd libraries, so we need to set the default log level for it
@@ -136,6 +138,11 @@ func main() {
 			EnvVar: flagEnvVars["cache"],
 			Usage:  "where the git wizardry is stashed",
 		},
+
+		cli.StringFlag{
+			Name:   "cpuprofile",
+			Hidden: true,
+		},
 	}
 
 	app.Before = func(c *cli.Context) error {
@@ -154,11 +161,31 @@ func main() {
 		return nil
 	}
 
+	var cpuProfileF io.WriteCloser = nil
+	defer func() {
+		if cpuProfileF != nil {
+			pprof.StopCPUProfile()
+			cpuProfileF.Close()
+		}
+	}()
+
 	subcommandBeforeFactory := func(cmd string) cli.BeforeFunc {
 		return func(c *cli.Context) error {
 			err := flagsConfig.ApplyTo(cmd, c)
 			if err != nil {
 				return err
+			}
+
+			cpuProfile := c.GlobalString("cpuprofile")
+			if cpuProfile != "" {
+				cpuProfileF, err = os.Create(cpuProfile)
+				if err != nil {
+					return err
+				}
+				err = pprof.StartCPUProfile(cpuProfileF)
+				if err != nil {
+					return err
+				}
 			}
 
 			debugFlag = c.GlobalBool("debug")
