@@ -27,19 +27,32 @@ type ResolvedObject struct {
 	fetcher  remotes.Fetcher
 }
 
-func (obj ResolvedObject) fetchJSON(ctx context.Context, v interface{}) error {
+type resolvedObjectReader struct {
+	io.Reader
+	c func() error
+}
+
+func (r resolvedObjectReader) Close() error {
+	if r.c != nil {
+		return r.c()
+	}
+	return nil
+}
+
+// Raw returns the raw bytes of the given object with no parsing/processing (but with digest/size verification, including eating any leftover whitespace if left unread; so be sure to eat everything if you don't want Close to error)
+func (obj ResolvedObject) Raw(ctx context.Context) (io.ReadCloser, error) {
 	// prevent go-digest panics later
 	if err := obj.Desc.Digest.Validate(); err != nil {
-		return err
+		return nil, err
 	}
 
 	// (perhaps use a containerd content store?? they do validation of all content they ingest, and then there's a cache)
 
 	r, err := obj.fetcher.Fetch(ctx, obj.Desc)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer r.Close()
+	// defer r.Close() // needs to be part of our ReadCloser -- see below (needs to be part of any error returns below this too, if there are any)
 
 	// make sure we can't possibly read (much) more than we're supposed to
 	limited := &io.LimitedReader{
@@ -51,34 +64,58 @@ func (obj ResolvedObject) fetchJSON(ctx context.Context, v interface{}) error {
 	verifier := obj.Desc.Digest.Verifier()
 	tee := io.TeeReader(limited, verifier)
 
-	// decode directly! (mostly avoids double memory hit for big objects)
-	// (TODO protect against malicious objects somehow?)
-	if err := json.NewDecoder(tee).Decode(v); err != nil {
-		return err
+	ret := resolvedObjectReader{
+		Reader: tee,
 	}
+	ret.c = func() error {
+		ret.c = nil     // to make sure we don't invoke this close method more than once
+		defer r.Close() // just to make sure it happens for sure
 
-	// read anything leftover ...
-	bs, err := io.ReadAll(tee)
+		// read anything leftover ...
+		bs, err := io.ReadAll(tee)
+		if err != nil {
+			return err
+		}
+		// ... and make sure it was just whitespace, if anything
+		// TODO this should probably stream in batches instead of blindly doing "ReadAll" (could be a pretty obscene amount of whitespace and ReadAll reads in 512 byte batches anyhow)
+		for _, b := range bs {
+			if !unicode.IsSpace(rune(b)) {
+				return fmt.Errorf("unexpected non-whitespace at the end of %q: %+v\n", obj.Desc.Digest.String(), rune(b))
+			}
+		}
+
+		// after reading *everything*, we should have exactly one byte left in our LimitedReader (anything else is an error)
+		if limited.N < 1 {
+			return fmt.Errorf("size of %q is bigger than it should be (%d)", obj.Desc.Digest.String(), obj.Desc.Size)
+		} else if limited.N > 1 {
+			return fmt.Errorf("size of %q is %d bytes smaller than it should be (%d)", obj.Desc.Digest.String(), limited.N-1, obj.Desc.Size)
+		}
+
+		// and finally, let's verify our checksum
+		if !verifier.Verified() {
+			return fmt.Errorf("digest of %q not correct", obj.Desc.Digest.String())
+		}
+
+		return r.Close()
+	}
+	return ret, nil
+}
+
+func (obj ResolvedObject) fetchJSON(ctx context.Context, v interface{}) error {
+	r, err := obj.Raw(ctx)
 	if err != nil {
 		return err
 	}
-	// ... and make sure it was just whitespace, if anything
-	for _, b := range bs {
-		if !unicode.IsSpace(rune(b)) {
-			return fmt.Errorf("unexpected non-whitespace at the end of %q: %+v\n", obj.Desc.Digest.String(), rune(b))
-		}
+	defer r.Close() // just in case / to be absolutely sure
+
+	// decode directly! (mostly avoids double memory hit for big objects)
+	// (TODO protect against malicious objects somehow?)
+	if err := json.NewDecoder(r).Decode(v); err != nil {
+		return err
 	}
 
-	// after reading *everything*, we should have exactly one byte left in our LimitedReader (anything else is an error)
-	if limited.N < 1 {
-		return fmt.Errorf("size of %q is bigger than it should be (%d)", obj.Desc.Digest.String(), obj.Desc.Size)
-	} else if limited.N > 1 {
-		return fmt.Errorf("size of %q is %d bytes smaller than it should be (%d)", obj.Desc.Digest.String(), limited.N-1, obj.Desc.Size)
-	}
-
-	// and finally, let's verify our checksum
-	if !verifier.Verified() {
-		return fmt.Errorf("digest of %q not correct", obj.Desc.Digest.String())
+	if err := r.Close(); err != nil {
+		return err
 	}
 
 	return nil
